@@ -98,9 +98,11 @@ impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
 
         let (sender, body) = Body::channel();
         self.add_client(channel, sender);
-
+        
+        // "Cache-Control", "no-transform" is set due to an issue with proxy buffers and WDS
+        // https://github.com/facebook/create-react-app/issues/1633#issuecomment-448132937
         Response::builder()
-            .header("Cache-Control", "no-transform")
+            .header("Cache-Control", "no-transform") 
             .header("X-Accel-Buffering", "no")
             .header("Content-Type", "text/event-stream")
             .header("Access-Control-Allow-Origin", "*")
