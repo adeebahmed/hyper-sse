@@ -1,7 +1,6 @@
 extern crate base64;
 extern crate futures;
 extern crate hyper;
-extern crate libhydrogen;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
@@ -11,7 +10,6 @@ extern crate tokio;
 use futures::future;
 use hyper::{Body, Chunk, Request, Response, StatusCode};
 use hyper::rt::{Future, Stream};
-use libhydrogen::secretbox::Key;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -23,8 +21,6 @@ use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::timer::Interval;
-
-const HYDRO_CONTEXT: &'static str = "ssetoken";
 
 type Clients = Vec<Client>;
 type Channels<C> = HashMap<C, Clients>;
@@ -44,7 +40,6 @@ type Channels<C> = HashMap<C, Clients>;
 pub struct Server<C> {
     channels: Mutex<Channels<C>>,
     next_id: AtomicUsize,
-    token_key: Key,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -56,13 +51,10 @@ struct AuthToken<C> {
 impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
     /// Create a new SSE push-server.
     pub fn new() -> Server<C> {
-        libhydrogen::init()
-            .expect("could not init libhydrogen");
 
         Server {
             channels: Mutex::new(HashMap::new()),
             next_id: AtomicUsize::new(0),
-            token_key: Key::gen(),
         }
     }
 
@@ -88,28 +80,14 @@ impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
     /// request cannot be parsed correctly or the auth token is expired,
     /// an appropriate http error response is returned.
     pub fn create_stream(&self, request: &Request<Body>) -> Response<Body> {
-        use base64::{decode_config, URL_SAFE_NO_PAD};
-        use libhydrogen::secretbox::decrypt;
-
         // Extract channel from uri path (last segment)
         let channel = request.uri().path()
             .rsplit('/').next()
             .and_then(|channel_str| C::from_str(channel_str).ok());
 
-        // Extract auth token from query, decode, decrypt and deserialize
-        let token = request.uri().query()
-            .and_then(|query| decode_config(query, URL_SAFE_NO_PAD).ok())
-            .and_then(|opaque_token| decrypt(
-                &opaque_token, 0, &HYDRO_CONTEXT.into(),
-                &self.token_key).ok()
-            )
-            .and_then(|token_str|
-                serde_json::from_slice::<AuthToken<C>>(&token_str).ok()
-            );
-
         // Check if the request contained a valid channel and token
-        let (channel, token) = match (channel, token) {
-            (Some(channel), Some(token)) => (channel, token),
+        let channel = match channel {
+            Some(channel) => channel,
             _ => {
                 return Response::builder()
                     .status(StatusCode::BAD_REQUEST)
@@ -117,23 +95,6 @@ impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
                     .expect("Could not create response");
             }
         };
-
-        // Check that the auth token is not older than 24 hours and
-        // specifies the correct channel
-        let correct_channel = match token.allowed_channel {
-            Some(token_channel) => channel == token_channel,
-            None => true, // None means all channels are allowed
-        };
-        let fresh_token = match SystemTime::now().duration_since(token.created) {
-            Ok(duration) => duration.as_secs() < 24 * 60 * 60,
-            Err(_) => true, // Token is in the future (time shift)
-        };
-        if !correct_channel || !fresh_token {
-            return Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body(Body::empty())
-                .expect("Could not create response");
-        }
 
         let (sender, body) = Body::channel();
         self.add_client(channel, sender);
@@ -145,32 +106,6 @@ impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
             .header("Access-Control-Allow-Origin", "*")
             .body(body)
             .expect("Could not create response")
-    }
-
-    /// Create an opaque authorization token that will be checked
-    /// in `create_stream` before establishing the SSE stream.
-    ///
-    /// A new token can be send to the client on every request, as
-    /// creating and checking the tokens is cheap. The token is valid
-    /// for 24 hours after it has been generated and can only be used
-    /// on the specified channel if specified. The token must be passed
-    /// as the query url segment to the sse endpoint.
-    ///
-    /// Returns an error if the channel serialization fails.
-    pub fn generate_auth_token(&self, channel: Option<C>) -> Result<String, serde_json::error::Error> {
-        use base64::{encode_config, URL_SAFE_NO_PAD};
-        use libhydrogen::secretbox::encrypt;
-
-        let token = AuthToken {
-            created: SystemTime::now(),
-            allowed_channel: channel,
-        };
-        let token = serde_json::to_vec(&token)?;
-
-        let ciphertext = encrypt(&token, 0, &HYDRO_CONTEXT.into(), &self.token_key);
-        let opaque_token = encode_config(&ciphertext, URL_SAFE_NO_PAD);
-
-        Ok(opaque_token)
     }
 
     /// Send hearbeat to all clients on all channels.
